@@ -39,16 +39,14 @@ class direct_DQN(nn.Module):
         self.inputs={'data_length':data_length, 'num_of_actions':num_of_actions, 'noisy_layers':noisy_layers}
         self.fc1=Linear(data_length, 512)
         self.fc2=Linear(512, 1024)
-        if noisy_layers >= 2:
-            self.fc31=layers.FactorizedNoisy(1024, 512)
-        else:
-            self.fc31=Linear(1024, 512)
+        self.fc31=Linear(1024, 512)
         self.fc32=Linear(1024, 256)
-        if noisy_layers >= 1:
-            self.fc41=layers.FactorizedNoisy(512, num_of_actions) # left and right, and 1 extra for no control
-        else:
-            self.fc41=Linear(512, num_of_actions)
+        
+        self.fc41=Linear(512, num_of_actions)
         self.fc42=Linear(256, 1) # mean prediction
+        #with torch.no_grad():
+        #    self.fc41.bias[:] = 0.
+        #    self.fc42.bias[:] = 0.
         print(' + Number of params: {}'.format(sum([p.data.nelement() for p in self.parameters()])))
     def forward(self, x, noise=(None, None)):
         x = F.relu(self.fc1(x)[0])
@@ -108,7 +106,7 @@ class TrainDQN(object):
         # prepare to train
         self.net, self.target_net = self.net.cuda(), self.target_net.cuda()
         # the optimizer ***
-        self.optim = optim.Adam(self.net.parameters(), lr=args.lr, betas = (0.9, 0.9996), eps=1e-9) #LaProp(self.net.parameters(), centered=False, lr=args.lr, betas = (0.9, 0.9995) ,amsgrad=True)# # ,amsgrad=True, centered=True
+        self.optim = optim.Adam(self.net.parameters(), lr=args.lr, betas = (0.9, 0.9996), eps=1e-10) #LaProp(self.net.parameters(), centered=False, lr=args.lr, betas = (0.9, 0.9995) ,amsgrad=True)# # ,amsgrad=True, centered=True
         self.net.train()
         self.target_net.train()
         self.CDQN = args.CDQN
@@ -117,12 +115,13 @@ class TrainDQN(object):
         self.transitions_storage = RawArray('f', self.batch_size*self.memory.tree.data_size)
         self.transitions_ = np.frombuffer(self.transitions_storage,dtype='float32').reshape((self.batch_size, self.memory.tree.data_size))
         self.transitions = torch.from_numpy(self.transitions_)
+        #print(failing_reward, reward_shift)
     def clear_report(self):
         self.report_i = 0
         self.accu_err = 0.
     def __call__(self):
         # when a sampling is too large to obtain from the current replay memory, directly ignore
-        if len(self.memory) < self.batch_size: return
+        if len(self.memory) < 2*self.batch_size: return
 
         # update the target network
         if self.backup_counter == 0: 
@@ -133,7 +132,7 @@ class TrainDQN(object):
         if self.backup_counter >= self.backup_period: self.backup_counter=0
         
         indices, ISWeights_ = self.memory.obtain_sample(self.batch_size)
-        if data_augmentation is not None: data_augmentation(self.transitions_, self.input_length)
+        #if data_augmentation is not None: data_augmentation(self.transitions_, self.input_length)
         
         net, transitions = self.net, self.transitions
         # prepare the input data.
@@ -148,9 +147,9 @@ class TrainDQN(object):
             action_values, avg_value = net(previous_states)[:2]
             # dim=0 is sample dimension, while dim=1 at output is action dimension
             # call by index will reduce the number of dim by 1 at the called dimension
-            state_action_values = action_values.gather(1, transitions[:,-2].cuda().unsqueeze(1).long()).squeeze() + avg_value - action_values.mean(dim=1)
+            state_action_values = action_values.gather(1, transitions[:,-2].unsqueeze(1).long().cuda()).squeeze() + avg_value - action_values.mean(dim=1)
             # rescale the rewards by (1-\gamma_r)
-            rewards = (1-self.gamma)*transitions[:,-1].cuda()
+            rewards = ((1-self.gamma)*transitions[:,-1]).cuda()
             fail_mask = (transitions[:,-1]<=(failing_reward+reward_shift)).cuda()
 
             next_action_values, next_avg_value = self.target_net(next_states)[:2]
@@ -173,9 +172,9 @@ class TrainDQN(object):
             with torch.no_grad():
                 next_actions = next_action_values_current.max(1)[1]
             action_values, avg_value = net(previous_states)[:2]
-            state_action_values = action_values.gather(1, transitions[:,-2].cuda().unsqueeze(1).long()).squeeze() + avg_value - action_values.mean(dim=1)
+            state_action_values = action_values.gather(1, transitions[:,-2].unsqueeze(1).long().cuda()).squeeze() + avg_value - action_values.mean(dim=1)
             # rescale the rewards by (1-\gamma_r)
-            rewards = (1-self.gamma)*transitions[:,-1].cuda()
+            rewards = ((1-self.gamma)*transitions[:,-1]).cuda()
             fail_mask = (transitions[:,-1]<=(failing_reward+reward_shift)).cuda()
             with torch.no_grad():
                 next_action_values_target, next_avg_value_target = self.target_net(next_states)[:2]
@@ -190,7 +189,7 @@ class TrainDQN(object):
             expected_state_action_values[fail_mask] = transitions[:,-1][fail_mask] - failing_reward ### *****************
             self.memory.request_sample(self.batch_size)
 
-            unweighted_loss = 2.*F.smooth_l1_loss(state_action_values, expected_state_action_values, reduction='none', beta = 5.0) if float(torch.__version__.split(".")[1])<=8. else 2.*F.huber_loss(state_action_values, expected_state_action_values, reduction='none', delta = 5.0)
+            unweighted_loss = 2.*F.smooth_l1_loss(state_action_values, expected_state_action_values, reduction='none', beta = 5.0) if float(torch.__version__.split(".")[1])<=8. else 2.*F.huber_loss(state_action_values, expected_state_action_values, reduction='none', delta = 5.0) #F.mse_loss(state_action_values, expected_state_action_values, reduction='none')#
             ISWeights = torch.from_numpy(ISWeights_).to(unweighted_loss)
             loss = (unweighted_loss*ISWeights).mean()
             loss.backward()
@@ -208,7 +207,7 @@ class TrainDQN(object):
             print(surprise, next_states, previous_states)
             for para in net.parameters(): print(para)
         assert(success)
-        self.memory.batch_update(indices, np.sqrt(surprise))
+        self.memory.batch_update(indices, surprise)
         self.accu_err += np.mean(surprise*surprise*ISWeights_)
         # print deviation error
         self.report_i += 1
@@ -246,15 +245,17 @@ class SumTree(object):
         # [--------------data frame-------------]
         #             size: capacity
             self.len = RawValue('i',0)
+            assert passes_before_random>=0.
+            self.passes_before_random = passes_before_random
             self.passes = - passes_before_random
-            assert self.passes <= 0
 
             #self.childrens = []
             if policy == 'sequential': self.sequential = True
             elif policy == 'random': self.sequential = False
+            else: assert False, "the argument 'policy' must be either 'sequential' or 'random'"
 
         else:
-            self.capacity, self.len, self.passes, self.sequential, self.data_size, self.num_of_nodes = capacity, data_tree.len, data_tree.passes, data_tree.sequential, data_tree.data_size, data_tree.num_of_nodes
+            self.capacity, self.len, self.passes, self.passes_before_random, self.sequential, self.data_size, self.num_of_nodes = capacity, data_tree.len, data_tree.passes, data_tree.passes_before_random, data_tree.sequential, data_tree.data_size, data_tree.num_of_nodes
             self.data = np.frombuffer(data_tree.data_buffer,dtype='float32').reshape((self.capacity,self.data_size))
             self.tree = np.frombuffer(data_tree.tree_buffer,dtype='float64')
             #data_tree.childrens.append(self)
@@ -267,7 +268,7 @@ class SumTree(object):
             self.update(tree_idx, p)  # update tree_frame
             self.data_pointer += 1
             self.passes += 1./self.capacity
-            if self.len.value != self.capacity: self.len.value += 1
+            if self.len.value != self.capacity: self.len.value = max(self.len.value, self.data_pointer)
             if self.data_pointer >= self.capacity:  # replace when exceed the capacity
                 self.data_pointer = 0
         elif self.sequential == False:
@@ -281,7 +282,11 @@ class SumTree(object):
 
     def recalculate_structure(self):
         compiled_recalculate_structure(self.tree, self.capacity)
-
+    
+    def restart_data_accumulation_through_rewriting(self):
+        self.passes = - self.passes_before_random
+        self.data_pointer = 0
+    
     def get_leaf(self, v):
         return compiled_get_leaf(v, self.tree, self.capacity, self.data)
 
@@ -362,7 +367,7 @@ class Memory(object):  # stored as ( s, action, reward ) in SumTree
     alpha = 0.6  # [0~1] convert the importance of TD error to priority
     beta = 0.1  # importance-sampling, from initial value increasing to 1
     beta_increment_per_sampling = 0.001
-    abs_err_upper = 10.*args.reward_multiply  # clipped abs error
+    abs_err_upper = 5.*args.reward_multiply  # clipped abs error
 
     def __init__(self, capacity, data_size, data_tree=None, policy = 'sequential', passes_before_random = 0.):
         self.inputs = {'capacity':capacity, 'data_size':data_size, 'policy':policy}
@@ -405,11 +410,11 @@ class Memory(object):  # stored as ( s, action, reward ) in SumTree
     def __len__(self):
         return self.tree.len.value
     def store(self, transition):
-        if self.max == 0.:
+        if self.max <= 0.:
             self.tree.add(self.abs_err_upper, transition)
         else: self.tree.add(self.max, transition)   # set the max p for new p
     def clean(self):
-        self.tree.recalculate_structure() # machine error accumulates
+        self.tree.recalculate_structure() # machine error might accumulate, which would make this method useful
     def obtain_sample(self, n):
         if self.__len__() < n: return
         if hasattr(self,'loader'):
@@ -429,12 +434,12 @@ class Memory(object):  # stored as ( s, action, reward ) in SumTree
         if hasattr(self,'batch_update_queue'):
             self.batch_update_queue.put((tree_idx, abs_errors))
             return
-        self.epsilon = 0.0001 * self.max
-        abs_errors += self.epsilon  # convert to abs and avoid 0
+        epsilon = 0.002 * self.max + self.epsilon
+        abs_errors = np.maximum(abs_errors, epsilon)  # convert to abs and avoid 0
         clipped_errors = np.minimum(abs_errors, self.abs_err_upper)
         assert(np.all(clipped_errors>=0.))
         compiled_batch_update(tree_idx,clipped_errors,self.alpha,self.tree.tree)
-        self.max = 0.95 * max(self.max, np.max(clipped_errors))
+        self.max = max(0.997 * self.max, np.max(clipped_errors))
 
 @njit(parallel=False)
 def compiled_sampling(n, data_size, total_p, beta, length, tree, capacity, tree_data, transition_storage):
@@ -450,13 +455,13 @@ def compiled_sampling(n, data_size, total_p, beta, length, tree, capacity, tree_
             compiled_recalculate_structure(tree, capacity)
             a, b = pri_seg * i, pri_seg * (i + 1)
             while p == 0.:
-                v = (b - a) * np.random.random_sample() + a
+                v = (b - a) * np.random.rand() + a
                 idx, p, data = compiled_get_leaf(v, tree, capacity, tree_data)
         prob = p / total_p
         ISWeights[i] = np.power(length*prob, -beta)
         b_idx[i], transition_storage[i] = idx, data
     # the sampled transitions from memory is already updated in the given transition_storage array
-    # !!! take care of the asynchronous access to the "transitions" array !!!
+    # !!! take care of the asynchronous access to the "transition_storage" array !!!
     return b_idx, ISWeights#, b_memory
 
 @njit(parallel=False)
@@ -483,6 +488,8 @@ def Load(LoadPipe, shared_data, Transitions_Sampling_Memory, Memory_Shape, batch
         else: time.sleep(0.05)
     pause_event, end_event, learning_in_progress_event = shared_things
     os.environ["NUMBA_NUM_THREADS"]="1"
+    period_of_result_printing = 10
+    first_success = False
     while not end_event.is_set():
         something_done = False
         last_episode = episode.value
@@ -491,6 +498,8 @@ def Load(LoadPipe, shared_data, Transitions_Sampling_Memory, Memory_Shape, batch
             something_done = True; episode.value += 1
             experience, t, avg_energy, steps_done = MemoryQueue.get()
             num_of_sample = len(experience)
+            if not args.no_augmentation:
+                num_of_sample /= 2.
             if num_of_sample==0 and not learning_in_progress_event.is_set(): learning_in_progress_event.set() 
             for i, array in enumerate(experience):
                 memory_in.store(array)
@@ -514,24 +523,29 @@ def Load(LoadPipe, shared_data, Transitions_Sampling_Memory, Memory_Shape, batch
                     if t < t_max:
                         last_achieved_time.value = t
                     else:
+                        if not first_success: # restart data accumulation by rewriting the initially obtained experience data
+                            first_success = True; memory_in.tree.restart_data_accumulation_through_rewriting()
                         print(colored('\nReset the counting of Episodes', 'yellow',attrs=['bold']))
                         episode.value = 1; failure_counter = 0
                         last_achieved_time.value = t
                         last_episode = 1
+                        period_of_result_printing = 1
                         learning_in_progress_event.set()
             elif t < t_max:
                 # If last_achieved_time.value == t_max but the new experience fails, we check whether it continues failing,
                 # and if so, we reset the "last_achieved_time" and go back 
                 failure_counter += 1
                 # we customarily let the counter reset when 10 successive failures occur 
-                if failure_counter == 20 and episode.value < args.lr_schedule[1][0]: last_achieved_time.value = t; learning_in_progress_event.clear()
-            elif failure_counter != 0: failure_counter = 0 
+                if failure_counter == 8: period_of_result_printing = 5
+                if failure_counter == 20: last_achieved_time.value = t; learning_in_progress_event.clear(); period_of_result_printing = 10
+            elif failure_counter != 0: failure_counter = 0; period_of_result_printing = 1
 
             if t != t_max: 
-                if last_achieved_time.value==t_max or episode.value%10==0:
+                if episode.value%period_of_result_printing==0:
                     print('Episode {}\tt = {:.2f}'.format(episode.value, t))
-            else: print('Episode {}\tavg energy = {:.5f}'.format(episode.value, avg_energy), flush=True)
-            if episode.value%100==0: print("epsilon = {:.4f}".format((0.3-0.005) * math.exp(-1. * steps_done / (100.*5*1200*args.train_episodes_multiplicative))+ 0.005))
+            else: 
+                print('Episode {}\tavg energy = {:.5f}'.format(episode.value, avg_energy), flush=True)
+            if episode.value%100==0: print("epsilon = {:.4f}".format((0.9-0.01) * math.exp(-1. * steps_done / (100.*5*1500*args.train_episodes_multiplicative))+ 0.01))
 
             # We are not sure whether a pause functionality is really needed, and it is added only for consistency with other processes. We have never
             # observed that the pause here can be triggered, and therefore, it has not been tested and there can be undiscovered bugs possibly.
@@ -551,7 +565,7 @@ def Load(LoadPipe, shared_data, Transitions_Sampling_Memory, Memory_Shape, batch
             time.sleep(0.01); last_idle_time+=0.01 # if not something done, pause for 0.01 second
             # if this sleep time is too large (e.g. 0.2), it will become a bottleneck of the whole program because this is in the main loop.
             # Take care.
-        elif last_idle_time != 0. and time.time() - last_time > 40.: 
+        elif last_idle_time != 0. and time.time() - last_time > 50.: 
             print('loader pending for {:.1f} seconds out of {:.1f}'.format(last_idle_time, time.time() - last_time))
             last_idle_time = 0.
             last_time = time.time()

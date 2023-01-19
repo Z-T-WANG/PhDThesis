@@ -24,8 +24,6 @@ if __name__ == '__main__':
 from arguments import args
 torch.cuda.set_device(args.gpu_id)
 torch.set_num_threads(1) # this is for CPU usage
-if args.seed != -1: 
-    random.seed(args.seed); torch.manual_seed(args.seed); np.random.seed(args.seed)
 
 set_control_forces(args.F_choices, args.F_max)
 num_of_controls = len(control_force_list)
@@ -65,57 +63,68 @@ real_sigma = sqrt(1./(I_xy*real_omega) /2.)
 gamma_factor = args.gamma_factor
 gamma = k*gamma_factor
 
-energy_shift = real_omega/pi+ 5.
+energy_shift = real_omega/pi+ 2.
 
 
 data_size = 125
 
-def data_augmentation(transition, data_length):
-    if random.random()<0.5:
-        states = transition[:,:2*data_length]
-        action = transition[:,-2].astype(int)
-        transition[:,:2*data_length] = states * flip_xy
-        action = action_flip_xy[action]
-        transition[:,-2] = action.astype(transition.dtype)
-
+############ deprecated
+#def data_augmentation(transition, data_length):
+#    if np.random.random()<0.5:
+#        states = transition[:,:2*data_length]
+#        action = transition[:,-2].astype(int)
+#        transition[:,:2*data_length] = states * flip_xy
+#        action = action_flip_xy[action]
+#        
+#        transition[:,-2] = action.astype(transition.dtype)
+#####################
 
 
 # set the reinforcement learning settings
 
-failing_reward = -(args.energy_cutoff)*reward_multiply
+failing_reward = -(args.energy_reward_bound+1.)*reward_multiply
 reward_shift = energy_shift*reward_multiply
 if __name__ == '__main__':
+    #print(failing_reward, reward_shift)
     import RL
-    RL.set_parameters(t_max=t_max, failing_reward=failing_reward, reward_shift=reward_shift, data_augmentation=data_augmentation if not args.no_augmentation else None)
+    RL.set_parameters(t_max=t_max, failing_reward=failing_reward, reward_shift=reward_shift, data_augmentation=None)
 
 ################################## end learning setting
 
 
 # Below is the worker function for subprocesses, which carries out the control simulations and pushes the experiences and records to queues that are collected and handled by other processes. (Quantum simulation is implemented in a compiled C module)
 # Because too many processes using CUDA will occupy a huge amount of GPU memory, we avoid using CUDA in these workers. Instead, these workers ask a manager process when they want to evaluate the neural network, and only the manager process is allowed to use CUDA to evaluate the neural network for the controls.
-def Control(net, pipes, shared_buffer, seed, EPS_START, idx):
+def Control(pipes, shared_buffer, seed, EPS_START, idx):
     simulation = __import__('simulation')
+
     # seeding
     random = np.random.RandomState(seed)
     simulation.set_seed(random.randint(0,999999))
     # preparing pipes
     MemoryQueue, ResultsQueue, ActionPipe, EndEvent, PauseEvent = pipes
     state_data_to_manager = np.frombuffer(shared_buffer,dtype='float32')
+    
+    (c_x_n, c_grid_size, c_k, c_I, c_Q_z, c_moment_order, c_error_boundary_length) = simulation.check_settings()
+    if c_x_n != 2*x_max+1 or c_grid_size != grid_size or c_k != k or c_I != I_xy or c_Q_z != args.Q_z:
+        print(colored("Setting Mismatch with the C package", 'red',attrs=['bold']))
+        EndEvent.set()
     # data input for the neural network
     __data__ = np.zeros((data_size,))
     def get_data(state):
         simulation.get_moments(state, __data__)
         return __data__
+    
     # random action decision hyperparameters
-    EPS_END = 0.005
-    EPS_DECAY = controls_per_unit_time*t_max*1200*args.train_episodes_multiplicative
+    EPS_END = 0.01
+    EPS_DECAY = controls_per_unit_time*t_max*1500*args.train_episodes_multiplicative
     # initialization
     steps_done = 0
     def call_force(data):
         if args.LQG:
             if random.uniform() < EPS_END:
-                shift_x, shift_y = random.normal(0.,1., 2) * 0.3
+                shift_x, shift_y = random.normal(0.,1., 2) * 0.35 # the random control has a std of 0.35 in both x and y direction
                 (shift_x, shift_y), action = map_to_discrete_forces(shift_x, shift_y)
+                assert 0<=action<=81
                 return (shift_x, shift_y), action, True
             data = data / args.input_scaling
             (shift_x, shift_y), action = map_to_discrete_forces(*LQG_bounded(data[0]/sqrt(k/2.), data[1]/sqrt(k/2.), data[2]*sqrt(2.*I_xy), data[3]*sqrt(2.*I_xy), control_time, k, I_xy, Q_z, args.F_max))
@@ -127,8 +136,9 @@ def Control(net, pipes, shared_buffer, seed, EPS_START, idx):
         eps_threshold += EPS_END
         steps_done += args.num_of_actors # this approximates the total steps_done of all the actors
         if random.uniform() < eps_threshold and not args.test:
-            shift_x, shift_y = random.normal(0.,1., 2) * 0.3
+            shift_x, shift_y = random.normal(0.,1., 2) * 0.35 # the random control has a std of 0.35 in both x and y direction
             (shift_x, shift_y), action = map_to_discrete_forces(shift_x, shift_y)
+            assert 0<=action<=81
             rnd = True
         else:
             # copy data to 
@@ -136,9 +146,9 @@ def Control(net, pipes, shared_buffer, seed, EPS_START, idx):
             while ActionPipe.poll(): ActionPipe.recv() # ensure that no data remain in the recv pipe
             ActionPipe.send(idx)
             action = ActionPipe.recv()
-            shift_x, shift_y = control_force_list[action]
+            #shift_x, shift_y = control_force_list[action]
             rnd = False
-        return (shift_x, shift_y), action, rnd
+        return control_force_list[action], action, rnd
     def Gaussian_packet(x, wavelength, mean, std):
         return np.exp(2.j*math.pi*(x-mean)/wavelength)*np.exp(-(x-mean)*(x-mean)/(4.*std*std))/sqrt(sqrt(2*math.pi)*std)
     x_array = ( np.arange(2*x_max+1).astype(np.complex128) - x_max ) * grid_size
@@ -148,7 +158,7 @@ def Control(net, pipes, shared_buffer, seed, EPS_START, idx):
     def do_episode():
         t = 0.
         # prepare the quantum state
-        y_start, x_start = random.uniform(0.,1., 2) * args.init_dist
+        y_start, x_start = random.uniform(-args.init_dist, args.init_dist, 2) 
         state = np.outer(Gaussian_packet(x_array, -2.*math.pi/(Q_z*x_start/2.), y_start, real_sigma), Gaussian_packet(x_array, 2.*math.pi/(Q_z*y_start/2.), x_start, real_sigma))
         # force is the parameter before -\pi\hat{x}, which is the physical force divided by \pi
         force = (0., 0.)
@@ -157,27 +167,35 @@ def Control(net, pipes, shared_buffer, seed, EPS_START, idx):
         i = 0
         experience = []
         accu_energy = 0.; accu_counter = 0; to_stop = False
-        while not t >= t_max-0.01*time_step:
+        while not t >= t_max-0.1*time_step:
             if i % control_interval == 0:
                 energy = simulation.energy(state)/omega
+                if energy > 80: print(colored('Numerical divergence has likely occurred: E={:.2f}'.format(energy), 'red',attrs=['bold']))
                 data = get_data(state)*args.input_scaling # the multiplication "args.input_scaling" ensures that "data" is a copy of "__data__"
+                #data__ = get_data(np.ascontiguousarray(state[::-1,::-1]))*args.input_scaling
+                #if not np.allclose(data__,data*flip_xy[:125]):
+                #    print("{}\n{}\n{}".format(data, data__, np.isclose(data__, data*flip_xy[:125])))
+                #    assert False
+                to_stop = to_stop or energy >= args.energy_cutoff
                 if args.train and i != 0:
-                    reward = -energy*reward_multiply + reward_shift
-                    if energy >= args.energy_cutoff: reward += failing_reward
-                    if to_stop: reward -= 1
+                    reward = -min(energy, args.energy_reward_bound)*reward_multiply + reward_shift
+                    if to_stop: reward += failing_reward
                     experience.append(np.hstack(( last_data, data, 
                         np.array([last_action],dtype=np.float32),  
                         np.array([reward],dtype=np.float32) )) )
-                if energy >= args.energy_cutoff or to_stop:
+                    if not args.no_augmentation:
+                        experience.append(np.hstack(( last_data*flip_xy[:125], data*flip_xy[:125], 
+                        np.array([action_flip_xy[last_action]],dtype=np.float32),  
+                        np.array([reward],dtype=np.float32) )) )
+                if to_stop:
                     break
                 (force_x, force_y), last_action, rnd = call_force(data) 
                 last_data = data
                 if t>30-0.01*time_step: accu_energy += energy; accu_counter += 1
-            #print(i, t)
             Fail, boundary_prob = simulation.simulate_n_steps(state, time_step, force_x, force_y, gamma, n_steps)
             i += n_steps
             t += time_step*n_steps
-            if boundary_prob>1.5e-3 and not to_stop: to_stop = True
+            if boundary_prob>1.5e-3 or to_stop: to_stop = True
         #print("an episode ends")
         # push experience into the main process and push results to the manager
         if t>= t_max-0.01*time_step: t=t_max
@@ -211,7 +229,7 @@ def worker_manager(net, pipes, num_of_processes, seed, others):
     torch.set_grad_enabled(False)
     # prepare the path
     if not os.path.isdir(args.folder_name): os.makedirs(args.folder_name, exist_ok=True)
-    training_data_file = os.path.join(args.folder_name, datetime.datetime.now().strftime("%Y_%m_%d %H_%M_%S")+".txt")
+    training_data_file = os.path.join(args.folder_name, datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S")+".txt")
     # prepare workers
     import multiprocessing as mp
     from multiprocessing.sharedctypes import RawArray
@@ -227,8 +245,8 @@ def worker_manager(net, pipes, num_of_processes, seed, others):
         np_memory = np.frombuffer(shared_buffer,dtype='float32')
         worker_data.append(torch.from_numpy(np_memory))
         seed = random.randrange(0,2**31 - 1)
-        EPS_START = 0.3 - n*(0.3-0.1)
-        processes.append( fork.Process( target=Control, args=(copy.deepcopy(net).cpu(), (MemoryQueue, results_queue, conn2, EndEvent, PauseEvent), shared_buffer, seed, EPS_START, n) ) )
+        EPS_START = 0.9 - n*(0.9-0.1)
+        processes.append( fork.Process( target=Control, args=((MemoryQueue, results_queue, conn2, EndEvent, PauseEvent), shared_buffer, seed, EPS_START, n) ) )
     net=net.cuda()
     net.eval()
     # prepare to save
@@ -257,19 +275,19 @@ def worker_manager(net, pipes, num_of_processes, seed, others):
                     simulated_T += result[0]/2.
                     performances.append(result[1]) # get the avg_energy in the result tuple
                     episode_passed += 1
-                    if args.write_training_data:
+                    if args.write_training_data and not EndEvent.is_set():
                         with open(training_data_file,'a') as f:
                             f.write('{}, {}\n'.format(simulated_T, result[1]))
                 # only if 50 additional episodes have passed, do we consider saving the next model
-                if episode_passed > 50 and len(performances) >= 8: 
-                    new_avg_energy = np.mean(np.array(performances[-8:]))
+                if episode_passed > 50 and len(performances) >= 10: 
+                    new_avg_energy = np.mean(np.array(performances[-10:]))
                     if new_avg_energy < good_actors[-1][0]:
                         good_actors[-1] = (new_avg_energy, copy.deepcopy(net).cpu())
                         good_actors.sort(key=lambda p: p[0], reverse=False) # sort in increasing order; "reverse" is False, in fact unnecessary
                         print(colored('new avg energy record: {:.5f}'.format(new_avg_energy), 'green',attrs=['bold']))
                         for idx, actor in enumerate(good_actors):
                             if type(actor[1]) != float:
-                                #torch.save(actor[1].state_dict(), os.path.join(args.folder_name,'{}.pth'.format(idx+1)))
+                                torch.save(actor[1].state_dict(), os.path.join(args.folder_name,'{}.pth'.format(idx+1)))
                                 existing_record_name = os.path.join(args.folder_name,'{}_record.txt'.format(idx+1))
                                 if os.path.isfile(existing_record_name): os.remove(existing_record_name)
                         episode_passed = 0
@@ -294,13 +312,14 @@ def worker_manager(net, pipes, num_of_processes, seed, others):
             if message_conn[i].poll():
                 idx=message_conn[i].recv()
                 if idx!=None:
+                    assert idx==i, "error?"
                     data_received_id.append(i) # the data sent through pipe is exactly the id
-                    network_input[num_of_data]=worker_data[i][:]
+                    network_input[num_of_data,:]=worker_data[i][:]
                     num_of_data += 1
                 else: process_ended += 1
-
-                while message_conn[i].poll(): # For safety; when False, this while loop is ignored
-                    message_conn[i].recv()
+                assert not message_conn[i].poll() ########################################################
+                #while message_conn[i].poll(): # For safety; when False, this while loop is ignored
+                #    message_conn[i].recv()
 
         # process the received data
         if num_of_data == 0:
@@ -308,7 +327,7 @@ def worker_manager(net, pipes, num_of_processes, seed, others):
             if args.LQG: time.sleep(0.1)
         else:
             action_values, avg_value, _noise = net(network_input[:num_of_data])
-            actions = action_values.max(1)[1].cpu()
+            actions = action_values.cpu().max(1)[1]
             for i,idx in enumerate(data_received_id):
                 message_conn[idx].send(actions[i].item())
         # update the network
@@ -328,7 +347,7 @@ if __name__ == '__main__':
         def __init__(self, train, num_of_processes, others=''):
             self.train = train
             self.processes = []
-            self.actor_update_time = 5.
+            self.actor_update_time = 10.
             self.lr_step = -1
             self.pending_training_updates = Value('d',0.,lock=True)
             # somehow RawValue also needs us to call ".value", otherwise it says the type is c_double or c_int
@@ -368,7 +387,7 @@ if __name__ == '__main__':
                 something_done = False # check whether nothing is done in one event loop
                 remaining_updates = self.pending_training_updates.value - updates_done
                 if remaining_updates >= 1. *downscaling_of_default_num_updates:
-                    if remaining_updates >= 150. *downscaling_of_default_num_updates and not self.pause_event.is_set():
+                    if remaining_updates >= 200. *downscaling_of_default_num_updates and not self.pause_event.is_set():
                         self.pause_event.set(); print('Wait for training')
                     loss = self.train()
                     # if we parallelize the training as a separate process, the following block should be deleted
@@ -377,7 +396,7 @@ if __name__ == '__main__':
                         something_done = True # one training step is done
                         if not started: started = True
                         # to reduce the frequency of calling "get_lock()", we only periodically reset the shared data "pending_training_updates"  
-                        if updates_done >= 200.*downscaling_of_default_num_updates or self.pause_event.is_set():
+                        if updates_done >= 250.*downscaling_of_default_num_updates or self.pause_event.is_set():
                             with self.pending_training_updates.get_lock():
                                 self.pending_training_updates.value -= updates_done
                                 updates_done = 0.
@@ -405,20 +424,22 @@ if __name__ == '__main__':
         def scale_up_actor_update_time(self, achieved_time, stabilized):
             changed = False
             # if it becomes unstable, we reset "self.actor_update_time"
-            if self.actor_update_time == 300. and not stabilized:
-                self.actor_update_time = 50; changed = True
-                self.train.report_period = 30
-            if achieved_time>=100. and self.actor_update_time<=150.:
-                self.actor_update_time = 300.; changed = True
+            #if self.actor_update_time == 1500. and not stabilized:
+            #    self.actor_update_time = 600.; changed = True
+            #    self.train.report_period = 30
+            if achieved_time>=100. and self.actor_update_time<=600.:
+                self.actor_update_time = 1000.; changed = True
                 self.train.report_period = 100
-            elif achieved_time>30. and self.actor_update_time<=25.:
-                self.actor_update_time = 50.; changed = True
-            elif achieved_time>15. and self.actor_update_time<=10.:
-                self.actor_update_time = 25.; changed = True
+            elif achieved_time>20. and self.actor_update_time<=60.:
+                self.actor_update_time = 300.; changed = True
+            elif achieved_time>10. and self.actor_update_time<=30.:
+                self.actor_update_time = 60.; changed = True
+            elif achieved_time>5. and self.actor_update_time<=15.:
+                self.actor_update_time = 30.; changed = True
             if changed and args.train: print('actor_update_time adjusted to {:.1f}'.format(self.actor_update_time))
         def adjust_learning_rate(self):
             if self.train.backup_period != self.backup_period and self.learning_in_progress_event.is_set():
-                self.train.backup_period = self.backup_period
+                self.train.backup_period = self.backup_period; print(colored("\nTarget Network update period set to be {}\n".format(self.train.backup_period),attrs=['bold']))
             # the learning rate schedule is written in "arguments.py"
             if self.episode.value >= args.lr_schedule[self.lr_step+1][0] and self.last_achieved_time.value == t_max:
                 self.lr_step += 1
@@ -472,7 +493,7 @@ if __name__ == '__main__':
 
     # set the replay memory
     capacity = round(args.size_of_replay_memory*controls_per_unit_time*t_max) if args.train else 1
-    memory = RL.Memory(capacity = capacity, data_size = data_size * 2 + 2, policy = 'sequential', passes_before_random = 2)
+    memory = RL.Memory(capacity = 2*capacity if not args.no_augmentation else capacity, data_size = data_size * 2 + 2, policy = 'sequential' if not args.CDQN else "random", passes_before_random = 0)
     # define the neural network
     net = RL.direct_DQN(data_size, num_of_controls, noisy_layers = 0).cuda()
     # set the task
@@ -503,7 +524,7 @@ if __name__ == '__main__':
         # for each model we run the main loop once
         for test_net in test_nets:
             net.load_state_dict(test_net[1])
-            train = RL.TrainDQN(net, memory, batch_size = args.batch_size, gamma=0.99, backup_period = args.target_network_update_interval, args=args)
+            train = RL.TrainDQN(net, memory, batch_size = args.batch_size, gamma=args.gamma_r, backup_period = args.target_network_update_interval, args=args)
             main = Main_System(train, num_of_processes=args.num_of_actors, others=test_net[0])
             main(args.num_of_test_episodes)
         del net

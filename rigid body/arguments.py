@@ -9,7 +9,7 @@ parser.add_argument('--x_max', default = 47, type=int,
                     help='the number of discretization sites in the simulation space, in both x and y direction, counted from the center to the boundary')
 parser.add_argument('--Q_z', default = 5, type=int,
                     help='the angular momentum in the local z direction, along the axis of the rotating quantum rod')
-parser.add_argument('--init_dist', default = 0.4, type=float, # 0.4
+parser.add_argument('--init_dist', default = 0.2, type=float, # 0.4
                     help='the maximal distance from the initialized state to the center of the trap, in both x and y coordinates')
 parser.add_argument('--gamma_factor', default = 3. , type=float,          # from 0.5 to 4. ?   Beyond 4. it tends to diverge.
                     help=r'the measurement strength \gamma divided by the potential strength k')
@@ -45,10 +45,12 @@ parser.add_argument('--num_of_test_episodes', default=1000, type=int,
 # training settings
 parser.add_argument('--gamma_r', default = 0.96, type=float,            # 0.96 ? (25 controls) 0.98 ? (50 controls)
                     help='the discount factor gamma in reinforcement learning')
-parser.add_argument('--batch_size', default = 256, type=int,
+parser.add_argument('--batch_size', default = 512, type=int,
                     help='the sampled minibatch size per update step in training')
 parser.add_argument('--n_times_per_sample', default = 8, type=int,
                     help='the number of times each experience is sampled and learned')
+parser.add_argument('--energy_reward_bound', default = 30., type=float,          # 20 ? 25 ? 30 ?
+                    help='the bound of the reward calculated from energy, beyond which we treat the reward as a constant')
 parser.add_argument('--size_of_replay_memory', default = 2000, type=int,
                     help='the size of the replay memory that stores the accumulated experiences, in units of full-length episodes.\nIts default value for "xp" and "wavefunction" input is 5000, and is 1000 for "measurements" input. When this argument receives a non-zero value, the default is overridden.')
 parser.add_argument('--target_network_update_interval', default = 300, type=int,
@@ -57,7 +59,7 @@ parser.add_argument('--train_episodes_multiplicative', default = 1., type=float,
                     help=r'the multiplicative factor that rescales the default number of simulated episodes (9000), each of time 100, i.e. \frac{100}{\omega_c}. The counting of episodes will be reset to 1 when the controller achieves time 100 for the first time, so it corresponds to the number of episodes after learning has started. This rescaling factor also rescales the learning rate schedule.')
 parser.add_argument('--maximum_trails_before_giveup', default = 200000, type=int,
                     help=r'the maximal number of simulated episodes when the learning does not proceed. If the simulated episodes exceed this value, we give up training.')
-parser.add_argument('--init_lr', default = 4e-4, type=float,
+parser.add_argument('--init_lr', default = 1e-3, type=float,
                     help='the initial learning rate. The learning rate will be decayed to 4e-5 at episode 1000, 8e-6 at 3000, 2e-6 at 5000, 4e-7 at 6500 and 1e-7 at 8000 when the current learning rate is higher.')
 parser.add_argument('--reward_multiply', default = 1., type=float,
                     help='a multiplicative factor of the reward for the AI')
@@ -94,9 +96,10 @@ args = parser.parse_args()
 args.write_training_data = True
 
 #assert 0. < args.eta <= 1., "The measurement efficiency should be larger than 0 and equal to or smaller than 1. It is currently {:.3g}.".format(args.eta)
+assert args.energy_reward_bound <= args.energy_cutoff
 
 args.num_of_episodes = round(9000*args.train_episodes_multiplicative)
-args.lr_schedule = [(round(t[0]*args.train_episodes_multiplicative) if t[0]!=float('inf') else t[0], t[1]) for t in [(0,3e-4), (1000,1e-4), (3000,4e-5), (5000,2e-5), (6500,8e-6), (8000,2e-6), (9000, 0.)]]
+args.lr_schedule = [(round(t[0]*args.train_episodes_multiplicative) if t[0]!=float('inf') else t[0], t[1]) for t in [(0,4e-4), (1000,2e-4), (3000,8e-5), (5000,3e-5), (7000,1e-5), (8000,4e-6), (9000, 0.)]]
 # set the default learning rate
 args.lr = args.init_lr
 

@@ -120,13 +120,13 @@ with open("moments.txt") as f:
     for i, line in enumerate(lines):
         moments = (line.strip()[1:-1]).split(',')
         moments = [int(moment) for moment in moments]
-        if moments[0]//2==1:
+        if moments[0]%2==1:
             flip_x[i] *= -1; flip_xy[i] *= -1
-        if moments[1]//2==1:
+        if moments[1]%2==1:
             flip_y[i] *= -1; flip_xy[i] *= -1
-        if moments[2]//2==1:
+        if moments[2]%2==1:
             flip_x[i] *= -1; flip_xy[i] *= -1
-        if moments[3]//2==1:
+        if moments[3]%2==1:
             flip_y[i] *= -1; flip_xy[i] *= -1
     flip_x[125:] = flip_x[:125]
     flip_y[125:] = flip_y[:125]
